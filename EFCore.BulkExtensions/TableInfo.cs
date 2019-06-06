@@ -32,11 +32,13 @@ namespace EFCore.BulkExtensions
         public string FullTempTableName => $"{SchemaFormated}[{TempDBPrefix}{TempTableName}]";
         public string FullTempOutputTableName => $"{SchemaFormated}[{TempDBPrefix}{TempTableName}Output]";
 
-        public bool CreatedOutputTable => (BulkConfig.SetOutputIdentity && HasSinglePrimaryKey) || BulkConfig.CalculateStats;
+        public bool CreatedOutputTable => BulkConfig.SetOutputIdentity || BulkConfig.CalculateStats;
 
         public bool InsertToTempTable { get; set; }
-        public bool HasIdentity { get; set; }
+        public string IdentityColumnName { get; set; }
+        public bool HasIdentity => IdentityColumnName != null;
         public bool HasOwnedTypes { get; set; }
+        public bool HasAbstractList { get; set; }
         public bool ColumnNameContainsSquareBracket { get; set; }
         public bool LoadOnlyPKColumn { get; set; }
         public int NumberOfEntities { get; set; }
@@ -44,6 +46,7 @@ namespace EFCore.BulkExtensions
         public BulkConfig BulkConfig { get; set; }
         public Dictionary<string, string> OutputPropertyColumnNamesDict { get; set; } = new Dictionary<string, string>();
         public Dictionary<string, string> PropertyColumnNamesDict { get; set; } = new Dictionary<string, string>();
+        public Dictionary<string, INavigation> OwnedTypesDict { get; set; } = new Dictionary<string, INavigation>();
         public HashSet<string> ShadowProperties { get; set; } = new HashSet<string>();
         public Dictionary<string, ValueConverter> ConvertibleProperties { get; set; } = new Dictionary<string, ValueConverter>();
         public string TimeStampOutColumnType => "varbinary(8)";
@@ -65,17 +68,24 @@ namespace EFCore.BulkExtensions
             }
 
             var isDeleteOperation = operationType == OperationType.Delete;
-            tableInfo.LoadData<T>(context, isDeleteOperation);
+            tableInfo.LoadData<T>(context, entities, isDeleteOperation);
             return tableInfo;
         }
 
         #region Main
-        public void LoadData<T>(DbContext context, bool loadOnlyPKColumn)
+        public void LoadData<T>(DbContext context, IList<T> entities, bool loadOnlyPKColumn)
         {
             LoadOnlyPKColumn = loadOnlyPKColumn;
-            var entityType = context.Model.FindEntityType(typeof(T));
+            var type = typeof(T);
+            var entityType = context.Model.FindEntityType(type);
             if (entityType == null)
-                throw new InvalidOperationException("DbContext does not contain EntitySet for Type: " + typeof(T).Name);
+            {
+                type = entities[0].GetType();
+                entityType = context.Model.FindEntityType(type);
+                HasAbstractList = true;
+            }
+            if (entityType == null)
+                throw new InvalidOperationException($"DbContext does not contain EntitySet for Type: { type.Name }");
 
             var relationalData = entityType.Relational();
             Schema = relationalData.Schema ?? "dbo";
@@ -89,8 +99,9 @@ namespace EFCore.BulkExtensions
 
             var allProperties = entityType.GetProperties().AsEnumerable();
 
-            var allNavigationProperties = entityType.GetNavigations().Where(a => a.GetTargetType().IsOwned());
-            HasOwnedTypes = allNavigationProperties.Any();
+            var ownedTypes = entityType.GetNavigations().Where(a => a.GetTargetType().IsOwned());
+            HasOwnedTypes = ownedTypes.Any();
+            OwnedTypesDict = ownedTypes.ToDictionary(a => a.Name, a => a);
 
             // timestamp/row version properties are only set by the Db, the property has a [Timestamp] Attribute or is configured in in FluentAPI with .IsRowVersion()
             // They can be identified by the columne type "timestamp" or .IsConcurrencyToken in combination with .ValueGenerated == ValueGenerated.OnAddOrUpdate
@@ -161,8 +172,7 @@ namespace EFCore.BulkExtensions
 
                 if (HasOwnedTypes)  // Support owned entity property update. TODO: Optimize
                 {
-                    var type = typeof(T);
-                    foreach (var navgationProperty in allNavigationProperties)
+                    foreach (var navgationProperty in ownedTypes)
                     {
                         var property = navgationProperty.PropertyInfo;
                         Type navOwnedType = type.Assembly.GetType(property.PropertyType.FullName);
@@ -222,84 +232,74 @@ namespace EFCore.BulkExtensions
         #region SqlCommands
         public void CheckHasIdentity(DbContext context)
         {
-            int hasIdentity = 0;
-            if (HasSinglePrimaryKey)
+            var sqlConnection = context.Database.GetDbConnection();
+            var currentTransaction = context.Database.CurrentTransaction;
+            try
             {
-                var sqlConnection = context.Database.GetDbConnection();
-                var currentTransaction = context.Database.CurrentTransaction;
-                try
+                if (currentTransaction == null)
                 {
-                    if (currentTransaction == null)
+                    if (sqlConnection.State != ConnectionState.Open)
+                        sqlConnection.Open();
+                }
+                using (var command = sqlConnection.CreateCommand())
+                {
+                    if (currentTransaction != null)
+                        command.Transaction = currentTransaction.GetDbTransaction();
+                    command.CommandText = SqlQueryBuilder.SelectIdentityColumnName(TableName, Schema);
+                    using (var reader = command.ExecuteReader())
                     {
-                        if (sqlConnection.State != ConnectionState.Open)
-                            sqlConnection.Open();
-                    }
-                    using (var command = sqlConnection.CreateCommand())
-                    {
-                        if (currentTransaction != null)
-                            command.Transaction = currentTransaction.GetDbTransaction();
-                        command.CommandText = SqlQueryBuilder.SelectIsIdentity(FullTableName, PropertyColumnNamesDict[PrimaryKeys[0]]);
-                        using (var reader = command.ExecuteReader())
+                        if (reader.HasRows)
                         {
-                            if (reader.HasRows)
+                            while (reader.Read())
                             {
-                                while (reader.Read())
-                                {
-                                    hasIdentity = reader[0] == DBNull.Value ? 0 : (int)reader[0];
-                                }
+                                IdentityColumnName = reader.GetString(0);
                             }
                         }
                     }
                 }
-                finally
-                {
-                    if (currentTransaction == null)
-                        sqlConnection.Close();
-                }
             }
-            HasIdentity = hasIdentity == 1;
+            finally
+            {
+                if (currentTransaction == null)
+                    sqlConnection.Close();
+            }
         }
 
         public async Task CheckHasIdentityAsync(DbContext context)
         {
-            int hasIdentity = 0;
-            if (HasSinglePrimaryKey)
+            var sqlConnection = context.Database.GetDbConnection();
+            var currentTransaction = context.Database.CurrentTransaction;
+            try
             {
-                var sqlConnection = context.Database.GetDbConnection();
-                var currentTransaction = context.Database.CurrentTransaction;
-                try
+                if (currentTransaction == null)
                 {
-                    if (currentTransaction == null)
+                    if (sqlConnection.State != ConnectionState.Open)
+                        await sqlConnection.OpenAsync().ConfigureAwait(false);
+                }
+                using (var command = sqlConnection.CreateCommand())
+                {
+                    if (currentTransaction != null)
+                        command.Transaction = currentTransaction.GetDbTransaction();
+                    command.CommandText = SqlQueryBuilder.SelectIdentityColumnName(TableName, Schema);
+                    using (var reader = await command.ExecuteReaderAsync().ConfigureAwait(false))
                     {
-                        if (sqlConnection.State != ConnectionState.Open)
-                            await sqlConnection.OpenAsync().ConfigureAwait(false);
-                    }
-                    using (var command = sqlConnection.CreateCommand())
-                    {
-                        if (currentTransaction != null)
-                            command.Transaction = currentTransaction.GetDbTransaction();
-                        command.CommandText = SqlQueryBuilder.SelectIsIdentity(FullTableName, PropertyColumnNamesDict[PrimaryKeys[0]]);
-                        using (var reader = await command.ExecuteReaderAsync().ConfigureAwait(false))
+                        if (reader.HasRows)
                         {
-                            if (reader.HasRows)
+                            while (await reader.ReadAsync().ConfigureAwait(false))
                             {
-                                while (await reader.ReadAsync().ConfigureAwait(false))
-                                {
-                                    hasIdentity = (int)reader[0];
-                                }
+                                IdentityColumnName = reader.GetString(0);
                             }
                         }
                     }
                 }
-                finally
+            }
+            finally
+            {
+                if (currentTransaction == null)
                 {
-                    if (currentTransaction == null)
-                    {
-                        sqlConnection.Close();
-                    }
+                    sqlConnection.Close();
                 }
             }
-            HasIdentity = hasIdentity == 1;
         }
 
         public bool CheckTableExist(DbContext context, TableInfo tableInfo)
@@ -420,6 +420,19 @@ namespace EFCore.BulkExtensions
         public void UpdateReadEntities<T>(IList<T> entities, IList<T> existingEntities)
         {
             List<string> propertyNames = PropertyColumnNamesDict.Keys.ToList();
+            if (HasOwnedTypes)
+            {
+                foreach (string ownedTypeName in OwnedTypesDict.Keys)
+                {
+                    var ownedTypeProperties = OwnedTypesDict[ownedTypeName].ClrType.GetProperties();
+                    foreach (var ownedTypeProperty in ownedTypeProperties)
+                    {
+                        propertyNames.Remove(ownedTypeName + "." + ownedTypeProperty.Name);
+                    }
+                    propertyNames.Add(ownedTypeName);
+                }
+            }
+
             List<string> selectByPropertyNames = PropertyColumnNamesDict.Keys.Where(a => PrimaryKeys.Contains(a)).ToList();
 
             var accessor = TypeAccessor.Create(typeof(T), true);
@@ -452,8 +465,9 @@ namespace EFCore.BulkExtensions
             if (BulkConfig.PreserveInsertOrder) // Updates PK in entityList
             {
                 var accessor = TypeAccessor.Create(typeof(T), true);
+                string identityPropertyName = PropertyColumnNamesDict.SingleOrDefault(a => a.Value == IdentityColumnName).Key;
                 for (int i = 0; i < NumberOfEntities; i++)
-                    accessor[entities[i], PrimaryKeys[0]] = accessor[entitiesWithOutputIdentity[i], PrimaryKeys[0]];
+                    accessor[entities[i], identityPropertyName] = accessor[entitiesWithOutputIdentity[i], identityPropertyName];
             }
             else // Clears entityList and then refills it with loaded entites from Db
             {
@@ -490,7 +504,7 @@ namespace EFCore.BulkExtensions
 
         public async Task LoadOutputDataAsync<T>(DbContext context, IList<T> entities) where T : class
         {
-            if (BulkConfig.SetOutputIdentity && HasSinglePrimaryKey)
+            if (BulkConfig.SetOutputIdentity)
             {
                 string sqlQuery = SqlQueryBuilder.SelectFromOutputTable(this);
                 var entitiesWithOutputIdentity = await QueryOutputTableAsync<T>(context, sqlQuery).ToListAsync().ConfigureAwait(false);

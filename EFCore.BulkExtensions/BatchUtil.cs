@@ -23,7 +23,7 @@ namespace EFCore.BulkExtensions
         // DELETE [a]
         // FROM [Table] AS [a]
         // WHERE [a].[Columns] = FilterValues
-        public static string GetSqlDelete<T>(IQueryable<T> query) where T : class, new()
+        public static string GetSqlDelete<T>(IQueryable<T> query) where T : class
         {
             (string sql, string tableAlias) = GetBatchSql(query);
             return $"DELETE [{tableAlias}]{sql}";
@@ -51,7 +51,7 @@ namespace EFCore.BulkExtensions
         /// <param name="query"></param>
         /// <param name="expression"></param>
         /// <returns></returns>
-        public static (string, List<SqlParameter>) GetSqlUpdate<T>(IQueryable<T> query, Expression<Func<T, T>> expression) where T : class, new()
+        public static (string, List<SqlParameter>) GetSqlUpdate<T>(IQueryable<T> query, Expression<Func<T, T>> expression) where T : class
         {
             (string sql, string tableAlias) = GetBatchSql(query);
             var sqlColumns = new StringBuilder();
@@ -61,7 +61,7 @@ namespace EFCore.BulkExtensions
             return ($"UPDATE [{tableAlias}] SET {sqlColumns.ToString()} {sql}", sqlParameters);
         }
 
-        public static (string, string) GetBatchSql<T>(IQueryable<T> query) where T : class, new()
+        public static (string, string) GetBatchSql<T>(IQueryable<T> query) where T : class
         {
             string sqlQuery = query.ToSql();
             string tableAlias = sqlQuery.Substring(8, sqlQuery.IndexOf("]") - 8);
@@ -85,23 +85,26 @@ namespace EFCore.BulkExtensions
                 var pArray = propertyName.Split(new char[] { '.' });
                 Type lastType = updateValuesType;
                 PropertyInfo property = lastType.GetProperty(pArray[0]);
-                object propertyUpdateValue = property.GetValue(updateValues);
-                object propertyDefaultValue = property.GetValue(defaultValues);
-                for (int i = 1; i < pArray.Length; i++)
+                if (property != null)
                 {
-                    lastType = property.PropertyType;
-                    property = lastType.GetProperty(pArray[i]);
-                    propertyUpdateValue = propertyUpdateValue != null ? property.GetValue(propertyUpdateValue) : propertyUpdateValue;
-                    var lastDefaultValues = lastType.Assembly.CreateInstance(lastType.FullName);
-                    propertyDefaultValue = property.GetValue(lastDefaultValues);
-                }
+                    object propertyUpdateValue = property.GetValue(updateValues);
+                    object propertyDefaultValue = property.GetValue(defaultValues);
+                    for (int i = 1; i < pArray.Length; i++)
+                    {
+                        lastType = property.PropertyType;
+                        property = lastType.GetProperty(pArray[i]);
+                        propertyUpdateValue = propertyUpdateValue != null ? property.GetValue(propertyUpdateValue) : propertyUpdateValue;
+                        var lastDefaultValues = lastType.Assembly.CreateInstance(lastType.FullName);
+                        propertyDefaultValue = property.GetValue(lastDefaultValues);
+                    }
 
-                bool isDifferentFromDefault = propertyUpdateValue != null && propertyUpdateValue?.ToString() != propertyDefaultValue?.ToString();
-                if (isDifferentFromDefault || (updateColumns != null && updateColumns.Contains(propertyName)))
-                {
-                    sql += $"[{columnName}] = @{columnName}, ";
-                    propertyUpdateValue = propertyUpdateValue ?? DBNull.Value;
-                    parameters.Add(new SqlParameter($"@{columnName}", propertyUpdateValue));
+                    bool isDifferentFromDefault = propertyUpdateValue != null && propertyUpdateValue?.ToString() != propertyDefaultValue?.ToString();
+                    if (isDifferentFromDefault || (updateColumns != null && updateColumns.Contains(propertyName)))
+                    {
+                        sql += $"[{columnName}] = @{columnName}, ";
+                        propertyUpdateValue = propertyUpdateValue ?? DBNull.Value;
+                        parameters.Add(new SqlParameter($"@{columnName}", propertyUpdateValue));
+                    }
                 }
             }
             if (String.IsNullOrEmpty(sql))
@@ -192,6 +195,15 @@ namespace EFCore.BulkExtensions
                         break;
                     case ExpressionType.Subtract:
                         sqlColumns.Append(" -");
+                        break;
+                    case ExpressionType.And:
+                        sqlColumns.Append(" &");
+                        break;
+                    case ExpressionType.Or:
+                        sqlColumns.Append(" |");
+                        break;
+                    case ExpressionType.ExclusiveOr:
+                        sqlColumns.Append(" ^");
                         break;
                     default: break;
                 }
